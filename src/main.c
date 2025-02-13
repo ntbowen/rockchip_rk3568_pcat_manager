@@ -626,7 +626,7 @@ static gboolean pcat_main_user_config_data_save()
 }
 
 static gboolean pcat_main_shutdown_check_timeout_func(
-    gpointer user_data)
+    G_GNUC_UNUSED gpointer user_data)
 {
     if(pcat_pmu_manager_shutdown_completed())
     {
@@ -655,7 +655,7 @@ static gboolean pcat_main_shutdown_check_timeout_func(
 }
 
 static gboolean pcat_main_reboot_check_timeout_func(
-    gpointer user_data)
+    G_GNUC_UNUSED gpointer user_data)
 {
     if(pcat_pmu_manager_reboot_completed())
     {
@@ -718,7 +718,7 @@ static void pcat_main_system_reboot()
     g_pcat_main_reboot = TRUE;
 }
 
-static gboolean pcat_main_sigterm_func(gpointer user_data)
+static gboolean pcat_main_sigterm_func(G_GNUC_UNUSED gpointer user_data)
 {
     g_message("SIGTERM detected.");
 
@@ -743,7 +743,7 @@ static gboolean pcat_main_sigterm_func(gpointer user_data)
     return TRUE;
 }
 
-static gboolean pcat_main_sigusr1_func(gpointer user_data)
+static gboolean pcat_main_sigusr1_func(G_GNUC_UNUSED gpointer user_data)
 {
     g_pcat_main_watchdog_disabled = TRUE;
     pcat_pmu_manager_watchdog_timeout_set(0);
@@ -751,7 +751,7 @@ static gboolean pcat_main_sigusr1_func(gpointer user_data)
     return TRUE;
 }
 
-static void *pcat_main_mwan_policy_check_thread_func(void *user_data)
+static void *pcat_main_mwan_policy_check_thread_func(G_GNUC_UNUSED void *user_data)
 {
     guint i, j;
     gchar *command;
@@ -983,7 +983,7 @@ static void *pcat_main_mwan_policy_check_thread_func(void *user_data)
 
                             if(upercent!=NULL)
                             {
-                                sscanf(upercent, "%d", &percent);
+                                sscanf(upercent, "%u", &percent);
                             }
                         }
 
@@ -1051,7 +1051,7 @@ static void *pcat_main_mwan_policy_check_thread_func(void *user_data)
 
                             if(upercent!=NULL)
                             {
-                                sscanf(upercent, "%d", &percent);
+                                sscanf(upercent, "%u", &percent);
                             }
                         }
 
@@ -1136,7 +1136,7 @@ static void *pcat_main_mwan_policy_check_thread_func(void *user_data)
     return NULL;
 }
 
-static void *pcat_main_connection_check_thread_func(void *user_data)
+static void *pcat_main_connection_check_thread_func(G_GNUC_UNUSED void *user_data)
 {
     guint i;
     static const gchar * const check_address_list[] = {"1.1.1.1", "8.8.8.8",
@@ -1214,7 +1214,7 @@ static void *pcat_main_connection_check_thread_func(void *user_data)
     return NULL;
 }
 
-static gboolean pcat_main_status_check_timeout_func(gpointer user_data)
+static gboolean pcat_main_status_check_timeout_func(G_GNUC_UNUSED gpointer user_data)
 {
     if(g_pcat_main_net_status_led_applied_mode!=
            g_pcat_main_network_route_mode)
@@ -1271,7 +1271,7 @@ static gboolean pcat_main_status_check_timeout_func(gpointer user_data)
 }
 
 static void pcat_main_log_handle_func(const gchar *log_domain,
-    GLogLevelFlags log_level, const gchar *message, gpointer user_data)
+    GLogLevelFlags log_level, const gchar *message, G_GNUC_UNUSED gpointer user_data)
 {
     const char *level = "";
     GLogLevelFlags minlevel = G_LOG_LEVEL_INFO;

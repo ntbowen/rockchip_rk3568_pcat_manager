@@ -123,11 +123,192 @@ static guint g_pat_pmu_manager_battery_charge_table[11] =
     4200, 4150, 4100, 4050, 4000, 3950, 3900, 3850, 3800, 3750, 3700
 };
 
-static gboolean pcat_pmu_serial_open(PCatPMUManagerData *pmu_data);
-static void pcat_pmu_serial_close(PCatPMUManagerData *pmu_data);
+/* Function declarations */
+gboolean pcat_pmu_serial_open(PCatPMUManagerData *pmu_data);
+void pcat_pmu_serial_close(PCatPMUManagerData *pmu_data);
+void pcat_pmu_manager_command_data_free(PCatPMUManagerCommandData *data);
+guint16 pcat_pmu_serial_compute_crc16(const guint8 *data, gsize len);
+gboolean pcat_pmu_serial_write_watch_func(G_GNUC_UNUSED GIOChannel *source, G_GNUC_UNUSED GIOCondition condition, gpointer user_data);
+void pcat_pmu_serial_write_data_request(PCatPMUManagerData *pmu_data, guint16 command, gboolean frame_num_set, guint16 frame_num, const guint8 *extra_data, guint16 extra_data_len, gboolean need_ack);
+void pcat_pmu_manager_date_time_sync(PCatPMUManagerData *pmu_data);
+void pcat_pmu_manager_schedule_time_update_internal(PCatPMUManagerData *pmu_data);
+void pcat_pmu_manager_charger_on_auto_start_internal(PCatPMUManagerData *pmu_data, gboolean state);
+void pcat_pmu_manager_pmu_fw_version_get_internal(PCatPMUManagerData *pmu_data);
+void pcat_pmu_manager_power_on_event_get_internal(PCatPMUManagerData *pmu_data);
+void pcat_pmu_manager_net_status_led_setup_internal(PCatPMUManagerData *pmu_data, guint on_time, guint down_time, guint repeat);
+void pcat_pmu_serial_read_data_parse(PCatPMUManagerData *pmu_data);
+gboolean pcat_pmu_serial_read_watch_func(GIOChannel *source, G_GNUC_UNUSED GIOCondition condition, gpointer user_data);
+gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data);
+gboolean pcat_pmu_manager_init();
+void pcat_pmu_manager_uninit();
+void pcat_pmu_manager_shutdown_request();
+void pcat_pmu_manager_reboot_request();
+gboolean pcat_pmu_manager_shutdown_completed();
+gboolean pcat_pmu_manager_reboot_completed();
+void pcat_pmu_manager_watchdog_timeout_set(guint timeout);
+gboolean pcat_pmu_manager_pmu_status_get(guint *battery_voltage, guint *charger_voltage, gboolean *on_battery, guint *battery_percentage);
+void pcat_pmu_manager_schedule_time_update();
+void pcat_pmu_manager_charger_on_auto_start(gboolean state);
+void pcat_pmu_manager_net_status_led_setup(guint on_time, guint down_time, guint repeat);
+const gchar *pcat_pmu_manager_pmu_fw_version_get();
+gint64 pcat_pmu_manager_charger_on_auto_start_last_timestamp_get();
+void pcat_pmu_manager_voltage_threshold_set(guint led_vh, guint led_vm, guint led_vl, guint startup_voltage, guint charger_voltage, guint shutdown_voltage, guint led_work_vl, guint charger_fast_voltage);
+gint pcat_pmu_manager_board_temp_get();
+void pcat_pmu_manager_voltage_threshold_set_interval(PCatPMUManagerData *pmu_data, guint voltage_threshold_low_1, guint voltage_threshold_high_1, guint voltage_threshold_low_2, guint voltage_threshold_high_2, guint voltage_threshold_low_3, guint voltage_threshold_high_3, guint voltage_threshold_low_4, guint voltage_threshold_high_4);
 
-static void pcat_pmu_manager_command_data_free(
-    PCatPMUManagerCommandData *data)
+/* Function definitions */
+gboolean pcat_pmu_serial_open(PCatPMUManagerData *pmu_data)
+{
+    PCatManagerMainConfigData *main_config_data;
+    int fd;
+    GIOChannel *channel;
+    struct termios options;
+    int rspeed = B115200;
+
+    main_config_data = pcat_main_config_data_get();
+
+    fd = open(main_config_data->pm_serial_device,
+        O_RDWR | O_NOCTTY | O_NDELAY);
+    if(fd < 0)
+    {
+        g_warning("Failed to open serial port %s: %s",
+            main_config_data->pm_serial_device, strerror(errno));
+
+        return FALSE;
+    }
+
+    switch(main_config_data->pm_serial_baud)
+    {
+        case 4800:
+        {
+            rspeed = B4800;
+            break;
+        }
+        case 9600:
+        {
+            rspeed = B9600;
+            break;
+        }
+        case 19200:
+        {
+            rspeed = B19200;
+            break;
+        }
+        case 38400:
+        {
+            rspeed = B38400;
+            break;
+        }
+        case 57600:
+        {
+            rspeed = B57600;
+            break;
+        }
+        case 115200:
+        {
+            rspeed = B115200;
+            break;
+        }
+        default:
+        {
+            g_warning("Invalid serial speed, set to default speed at %u.",
+                115200);
+            break;
+        }
+    }
+
+    tcgetattr(fd, &options);
+    cfmakeraw(&options);
+    cfsetispeed(&options, rspeed);
+    cfsetospeed(&options, rspeed);
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~PARODD;
+    options.c_cflag &= ~CSTOPB;
+    options.c_cflag &= ~CRTSCTS;
+    options.c_cflag |= CS8;
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_iflag &= ~(IGNBRK | BRKINT | ICRNL |
+        INLCR | PARMRK | INPCK | ISTRIP | IXON | IXOFF | IXANY);
+    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG | IEXTEN);
+    options.c_oflag &= ~OPOST;
+    options.c_cc[VMIN] = 1;
+    options.c_cc[VTIME] = 0;
+    tcflush(fd, TCIOFLUSH);
+    tcsetattr(fd, TCSANOW, &options);
+
+    channel = g_io_channel_unix_new(fd);
+    if(channel==NULL)
+    {
+        g_warning("Cannot open channel for serial port %s!",
+            main_config_data->pm_serial_device);
+        close(fd);
+
+        return FALSE;
+    }
+    g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL);
+
+    if(pmu_data->serial_write_source > 0)
+    {
+        g_source_remove(pmu_data->serial_write_source);
+        pmu_data->serial_write_source = 0;
+    }
+
+    if(pmu_data->serial_read_source > 0)
+    {
+        g_source_remove(pmu_data->serial_read_source);
+        pmu_data->serial_read_source = 0;
+    }
+    if(pmu_data->serial_channel!=NULL)
+    {
+        g_io_channel_unref(pmu_data->serial_channel);
+    }
+    if(pmu_data->serial_fd > 0)
+    {
+        close(pmu_data->serial_fd);
+        pmu_data->serial_fd = -1;
+    }
+
+    pmu_data->serial_fd = fd;
+    pmu_data->serial_channel = channel;
+
+    pmu_data->serial_read_source = g_io_add_watch(channel,
+        G_IO_IN, pcat_pmu_serial_read_watch_func, pmu_data);
+
+    g_message("Open PMU serial port %s successfully.",
+        main_config_data->pm_serial_device);
+
+    return TRUE;
+}
+
+void pcat_pmu_serial_close(PCatPMUManagerData *pmu_data)
+{
+    if(pmu_data->serial_write_source > 0)
+    {
+        g_source_remove(pmu_data->serial_write_source);
+        pmu_data->serial_write_source = 0;
+    }
+
+    if(pmu_data->serial_read_source > 0)
+    {
+        g_source_remove(pmu_data->serial_read_source);
+        pmu_data->serial_read_source = 0;
+    }
+
+    if(pmu_data->serial_channel!=NULL)
+    {
+        g_io_channel_unref(pmu_data->serial_channel);
+        pmu_data->serial_channel = NULL;
+    }
+
+    if(pmu_data->serial_fd > 0)
+    {
+        close(pmu_data->serial_fd);
+        pmu_data->serial_fd = -1;
+    }
+}
+
+void pcat_pmu_manager_command_data_free(PCatPMUManagerCommandData *data)
 {
     if(data==NULL)
     {
@@ -142,8 +323,7 @@ static void pcat_pmu_manager_command_data_free(
     g_free(data);
 }
 
-static inline guint16 pcat_pmu_serial_compute_crc16(const guint8 *data,
-    gsize len)
+guint16 pcat_pmu_serial_compute_crc16(const guint8 *data, gsize len)
 {
     guint16 crc = 0xFFFF;
     gsize i;
@@ -168,11 +348,10 @@ static inline guint16 pcat_pmu_serial_compute_crc16(const guint8 *data,
     return crc;
 }
 
-static gboolean pcat_pmu_serial_write_watch_func(GIOChannel *source,
-    GIOCondition condition, gpointer user_data)
+gboolean pcat_pmu_serial_write_watch_func(G_GNUC_UNUSED GIOChannel *source, G_GNUC_UNUSED GIOCondition condition, gpointer user_data)
 {
     PCatPMUManagerData *pmu_data = (PCatPMUManagerData *)user_data;
-    gssize wsize;
+    gssize wsize = 0;
     guint remaining_size;
     gboolean ret = FALSE;
     gint64 now;
@@ -290,10 +469,7 @@ static gboolean pcat_pmu_serial_write_watch_func(GIOChannel *source,
     return ret;
 }
 
-static void pcat_pmu_serial_write_data_request(
-    PCatPMUManagerData *pmu_data, guint16 command, gboolean frame_num_set,
-    guint16 frame_num, const guint8 *extra_data, guint16 extra_data_len,
-    gboolean need_ack)
+void pcat_pmu_serial_write_data_request(PCatPMUManagerData *pmu_data, guint16 command, gboolean frame_num_set, guint16 frame_num, const guint8 *extra_data, guint16 extra_data_len, gboolean need_ack)
 {
     GByteArray *ba;
     guint16 sv;
@@ -387,7 +563,30 @@ static void pcat_pmu_serial_write_data_request(
     }
 }
 
-static void pcat_pmu_manager_date_time_sync(PCatPMUManagerData *pmu_data)
+void pcat_pmu_serial_status_data_parse(PCatPMUManagerData *pmu_data,
+    const guint8 *data, guint16 len)
+{
+    guint16 battery_voltage, charger_voltage;
+    guint8 battery_percentage, board_temp;
+    gboolean on_battery;
+
+    if (!pmu_data || !data || len < 16)
+        return;
+
+    battery_voltage = (data[0] << 8) | data[1];
+    charger_voltage = (data[2] << 8) | data[3];
+    battery_percentage = data[4];
+    on_battery = (data[5] != 0);
+    board_temp = data[6];
+
+    pmu_data->last_battery_voltage = battery_voltage;
+    pmu_data->last_charger_voltage = charger_voltage;
+    pmu_data->last_battery_percentage = battery_percentage;
+    pmu_data->last_on_battery_state = on_battery;
+    pmu_data->board_temp = board_temp;
+}
+
+void pcat_pmu_manager_date_time_sync(PCatPMUManagerData *pmu_data)
 {
     guint8 data[7];
     GDateTime *dt;
@@ -414,14 +613,12 @@ static void pcat_pmu_manager_date_time_sync(PCatPMUManagerData *pmu_data)
         data, 7, TRUE);
 }
 
-static void pcat_pmu_manager_schedule_time_update_internal(
-    PCatPMUManagerData *pmu_data)
+void pcat_pmu_manager_schedule_time_update_internal(PCatPMUManagerData *pmu_data)
 {
     guint i;
     const PCatManagerUserConfigData *uconfig_data;
     const PCatManagerPowerScheduleData *sdata;
     GByteArray *startup_setup_buffer;
-    guint8 v;
 
     uconfig_data = pcat_main_user_config_data_get();
     if(uconfig_data->power_schedule_data!=NULL)
@@ -436,7 +633,7 @@ static void pcat_pmu_manager_schedule_time_update_internal(
                 continue;
             }
 
-            v = sdata->year & 0xFF;
+            guint8 v = sdata->year & 0xFF;
             g_byte_array_append(startup_setup_buffer, &v, 1);
             v = (sdata->year >> 8) & 0xFF;
             g_byte_array_append(startup_setup_buffer, &v, 1);
@@ -494,8 +691,7 @@ static void pcat_pmu_manager_schedule_time_update_internal(
     }
 }
 
-static void pcat_pmu_manager_charger_on_auto_start_internal(
-    PCatPMUManagerData *pmu_data, gboolean state)
+void pcat_pmu_manager_charger_on_auto_start_internal(PCatPMUManagerData *pmu_data, gboolean state)
 {
     guint8 v = state ? 1 : 0;
 
@@ -504,25 +700,21 @@ static void pcat_pmu_manager_charger_on_auto_start_internal(
         &v, 1, TRUE);
 }
 
-static void pcat_pmu_manager_pmu_fw_version_get_internal(
-    PCatPMUManagerData *pmu_data)
+void pcat_pmu_manager_pmu_fw_version_get_internal(PCatPMUManagerData *pmu_data)
 {
     pcat_pmu_serial_write_data_request(pmu_data,
         PCAT_PMU_MANAGER_COMMAND_PMU_FW_VERSION_GET, FALSE, 0,
         NULL, 0, TRUE);
 }
 
-static void pcat_pmu_manager_power_on_event_get_internal(
-    PCatPMUManagerData *pmu_data)
+void pcat_pmu_manager_power_on_event_get_internal(PCatPMUManagerData *pmu_data)
 {
     pcat_pmu_serial_write_data_request(pmu_data,
         PCAT_PMU_MANAGER_COMMAND_POWER_ON_EVENT_GET, FALSE, 0,
         NULL, 0, TRUE);
 }
 
-static void pcat_pmu_manager_net_status_led_setup_internal(
-    PCatPMUManagerData *pmu_data, guint on_time, guint down_time,
-    guint repeat)
+void pcat_pmu_manager_net_status_led_setup_internal(PCatPMUManagerData *pmu_data, guint on_time, guint down_time, guint repeat)
 {
     guint8 buffer[6];
     guint16 v;
@@ -541,384 +733,12 @@ static void pcat_pmu_manager_net_status_led_setup_internal(
         buffer, 6, TRUE);
 }
 
-static void pcat_pmu_manager_voltage_threshold_set_interval(
-    PCatPMUManagerData *pmu_data, guint led_vh, guint led_vm,
-    guint led_vl, guint startup_voltage, guint charger_voltage,
-    guint shutdown_voltage, guint led_work_vl, guint charger_fast_voltage)
-{
-    guint8 buffer[18];
-    const PCatManagerMainConfigData *main_config_data;
-    guint battery_full_threshold;
-
-    main_config_data = pcat_main_config_data_get();
-
-    if(led_vh==0)
-    {
-        led_vh = main_config_data->pm_led_high_voltage;
-    }
-    if(led_vm==0)
-    {
-        led_vm = main_config_data->pm_led_medium_voltage;
-    }
-    if(led_vl==0)
-    {
-        led_vl = main_config_data->pm_led_low_voltage;;
-    }
-    if(startup_voltage==0)
-    {
-        startup_voltage = main_config_data->pm_startup_voltage;
-    }
-    if(charger_voltage==0)
-    {
-        charger_voltage = main_config_data->pm_charger_limit_voltage;
-    }
-    if(shutdown_voltage==0)
-    {
-        shutdown_voltage = main_config_data->pm_auto_shutdown_voltage_general;
-    }
-    if(led_work_vl==0)
-    {
-        led_work_vl = main_config_data->pm_led_work_low_voltage;
-    }
-    if(charger_fast_voltage==0)
-    {
-        charger_fast_voltage = main_config_data->pm_charger_fast_voltage;
-    }
-
-    battery_full_threshold = main_config_data->pm_battery_full_threshold;
-
-    buffer[0] = led_vh & 0xFF;
-    buffer[1] = (led_vh >> 8) & 0xFF;
-    buffer[2] = led_vm & 0xFF;
-    buffer[3] = (led_vm >> 8) & 0xFF;
-    buffer[4] = led_vl & 0xFF;
-    buffer[5] = (led_vl >> 8) & 0xFF;
-    buffer[6] = startup_voltage & 0xFF;
-    buffer[7] = (startup_voltage >> 8) & 0xFF;
-    buffer[8] = charger_voltage & 0xFF;
-    buffer[9] = (charger_voltage >> 8) & 0xFF;
-    buffer[10] = shutdown_voltage & 0xFF;
-    buffer[11] = (shutdown_voltage >> 8) & 0xFF;
-    buffer[12] = led_work_vl & 0xFF;
-    buffer[13] = (led_work_vl >> 8) & 0xFF;
-    buffer[14] = charger_fast_voltage & 0xFF;
-    buffer[15] = (charger_fast_voltage >> 8) & 0xFF;
-
-    buffer[16] = battery_full_threshold & 0xFF;
-    buffer[17] = (battery_full_threshold >> 8) & 0xFF;
-
-    pcat_pmu_serial_write_data_request(pmu_data,
-        PCAT_PMU_MANAGER_COMMAND_VOLTAGE_THRESHOLD_SET, FALSE, 0,
-        buffer, 18, TRUE);
-}
-
-static void pcat_pmu_serial_status_data_parse(PCatPMUManagerData *pmu_data,
-    const guint8 *data, guint len)
-{
-    guint16 battery_voltage, charger_voltage;
-    guint16 gpio_input, gpio_output;
-    gint y, m, d, h, min, s;
-    GDateTime *pmu_dt, *host_dt;
-    gint64 pmu_unix_time, host_unix_time;
-    FILE *fp;
-    gdouble battery_percentage;
-    guint battery_percentage_i, battery_voltage_avg;
-    gboolean on_battery;
-    struct timeval tv;
-    guint8 board_temp = 0;
-    guint i;
-    gint64 now;
-    guint rtc_status = 0;
-
-    if(len < 16)
-    {
-        return;
-    }
-
-    battery_voltage = data[0] + ((guint16)data[1] << 8);
-    charger_voltage = data[2] + ((guint16)data[3] << 8);
-    gpio_input = data[4] + ((guint16)data[5] << 8);
-    gpio_output = data[6] + ((guint16)data[7] << 8);
-    y = data[8] + ((guint16)data[9] << 8);
-    m = data[10];
-    d = data[11];
-    h = data[12];
-    min = data[13];
-    s = data[14];
-
-    if(len >= 18)
-    {
-        rtc_status = data[16];
-        board_temp = data[17];
-    }
-
-    g_debug("PMU time: %d-%d-%d %02d:%02d:%02d, status: %u",
-        y, m, d, h, min, s, rtc_status);
-
-    now = g_get_monotonic_time();
-
-    if(pmu_data->system_time_set_flag)
-    {
-        if(now > pmu_data->pmu_time_set_timestamp + 15000000L)
-        {
-            pmu_dt = g_date_time_new_utc(y, m, d, h, min, (gdouble)s);
-            if(pmu_dt!=NULL)
-            {
-                pmu_unix_time = g_date_time_to_unix(pmu_dt);
-                g_date_time_unref(pmu_dt);
-            }
-            else
-            {
-                pmu_unix_time = 0;
-            }
-
-            host_dt = g_date_time_new_now_utc();
-            host_unix_time = g_date_time_to_unix(host_dt);
-            g_date_time_unref(host_dt);
-
-            if(pmu_unix_time > host_unix_time + 60 ||
-                host_unix_time > pmu_unix_time + 60)
-            {
-                g_message("PMU time out of sync: %d-%d-%d %02d:%02d:%02d, "
-                    "send time sync command.", y, m, d, h, min, s);
-
-                pmu_data->pmu_time_set_timestamp = now;
-
-                pcat_pmu_manager_date_time_sync(pmu_data);
-            }
-        }
-    }
-    else
-    {
-        pmu_dt = g_date_time_new_utc(y, m, d, h, min, (gdouble)s);
-        if(pmu_dt!=NULL)
-        {
-            pmu_unix_time = g_date_time_to_unix(pmu_dt);
-            g_date_time_unref(pmu_dt);
-
-            memset(&tv, 0, sizeof(struct timeval));
-            tv.tv_sec = pmu_unix_time;
-            settimeofday(&tv, NULL);
-
-            g_message("Read system time from PMU: %d-%d-%d %02d:%02d:%02d",
-                y, m, d, h, min, s);
-        }
-        else
-        {
-            g_warning("Invalid system time from PMU: %d-%d-%d %02d:%02d:%02d",
-                y, m, d, h, min, s);
-        }
-
-        pmu_data->pmu_time_set_timestamp = now;
-
-        pmu_data->system_time_set_flag = TRUE;
-    }
-
-    g_debug("PMU report battery voltage %u mV, charger voltage %u mV, "
-        "GPIO input state %X, output state %X.", battery_voltage,
-        charger_voltage, gpio_input, gpio_output);
-
-    on_battery = (charger_voltage < 4200);
-
-    if(!!pmu_data->last_on_battery_state != !!on_battery)
-    {
-        for(i=0;i<128;i++)
-        {
-            pmu_data->last_battery_voltages[i] = -1;
-        }
-    }
-    pmu_data->last_on_battery_state = on_battery;
-
-    for(i=0;i<128;i++)
-    {
-        if(pmu_data->last_battery_voltages[i] < 0)
-        {
-            pmu_data->last_battery_voltages[i] = battery_voltage;
-            break;
-        }
-    }
-    if(i>=128)
-    {
-        memmove(pmu_data->last_battery_voltages,
-            pmu_data->last_battery_voltages + 1, 127 * sizeof(gint));
-        pmu_data->last_battery_voltages[127] = battery_voltage;
-    }
-
-    battery_voltage_avg = 0;
-    for(i=0;i<128;i++)
-    {
-        if(pmu_data->last_battery_voltages[i] < 0)
-        {
-            break;
-        }
-        else
-        {
-            battery_voltage_avg += pmu_data->last_battery_voltages[i];
-        }
-    }
-
-    battery_voltage_avg /= i;
-    pmu_data->last_battery_voltage = battery_voltage;
-
-
-    battery_percentage = 100.0f;
-
-    if(!on_battery)
-    {
-        if(battery_voltage_avg > pmu_data->battery_charge_table[0])
-        {
-            battery_percentage = 100.0f;
-        }
-        else if(battery_voltage_avg > pmu_data->battery_charge_table[10])
-        {
-            battery_percentage = 0.0f;
-            for(i=0;i<10;i++)
-            {
-                if(battery_voltage_avg >= pmu_data->battery_charge_table[i+1])
-                {
-                    battery_percentage = (90.0f - 10 * i) +
-                        ((gdouble)battery_voltage_avg -
-                         pmu_data->battery_charge_table[i+1]) * 10 /
-                        (pmu_data->battery_charge_table[i] -
-                         pmu_data->battery_charge_table[i+1]);
-
-                    break;
-                }
-            }
-        }
-        else
-        {
-            battery_percentage = 0.0f;
-        }
-    }
-    else if(pcat_modem_manager_device_power_usage_get()>=2)
-    {
-        if(battery_voltage_avg > pmu_data->battery_discharge_table_5g[0])
-        {
-            battery_percentage = 100.0f;
-        }
-        else if(battery_voltage_avg > pmu_data->battery_discharge_table_5g[10])
-        {
-            battery_percentage = 0.0f;
-            for(i=0;i<10;i++)
-            {
-                if(battery_voltage_avg >=
-                    pmu_data->battery_discharge_table_5g[i+1])
-                {
-                    battery_percentage = (90.0f - 10 * i) +
-                        ((gdouble)battery_voltage_avg -
-                         pmu_data->battery_discharge_table_5g[i+1]) * 10 /
-                        (pmu_data->battery_discharge_table_5g[i] -
-                         pmu_data->battery_discharge_table_5g[i+1]);
-
-                    break;
-                }
-            }
-        }
-        else
-        {
-            battery_percentage = 0.0f;
-        }
-    }
-    else
-    {
-        if(battery_voltage_avg > pmu_data->battery_discharge_table_normal[0])
-        {
-            battery_percentage = 100.0f;
-        }
-        else if(battery_voltage_avg >
-            pmu_data->battery_discharge_table_normal[10])
-        {
-            battery_percentage = 0.0f;
-            for(i=0;i<10;i++)
-            {
-                if(battery_voltage_avg >=
-                    pmu_data->battery_discharge_table_normal[i+1])
-                {
-                    battery_percentage = (90.0f - 10 * i) +
-                        ((gdouble)battery_voltage_avg -
-                         pmu_data->battery_discharge_table_normal[i+1]) * 10 /
-                        (pmu_data->battery_discharge_table_normal[i] -
-                         pmu_data->battery_discharge_table_normal[i+1]);
-
-                    break;
-                }
-            }
-        }
-        else
-        {
-            battery_percentage = 0.0f;
-        }
-    }
-
-    pmu_data->last_charger_voltage = charger_voltage;
-    pmu_data->board_temp = board_temp;
-    pmu_data->board_temp -= 40;
-
-    if(on_battery)
-    {
-        battery_percentage_i = battery_percentage * 100;
-
-        if(battery_percentage_i < pmu_data->last_battery_percentage_cap)
-        {
-            pmu_data->last_battery_percentage_cap = battery_percentage_i;
-            pmu_data->last_battery_percentage = battery_percentage_i;
-        }
-        else
-        {
-            pmu_data->last_battery_percentage =
-                pmu_data->last_battery_percentage_cap;
-        }
-    }
-    else
-    {
-        pmu_data->last_battery_percentage_cap = 10000;
-        pmu_data->last_battery_percentage = battery_percentage * 100;
-    }
-
-    fp = fopen(PCAT_PMU_MANAGER_STATEFS_BATTERY_PATH"/ChargePercentage", "w");
-    if(fp!=NULL)
-    {
-        fprintf(fp, "%lf\n", battery_percentage);
-        fclose(fp);
-    }
-
-    fp = fopen(PCAT_PMU_MANAGER_STATEFS_BATTERY_PATH"/Voltage", "w");
-    if(fp!=NULL)
-    {
-        fprintf(fp, "%u\n", battery_voltage * 1000);
-        fclose(fp);
-    }
-
-    fp = fopen(PCAT_PMU_MANAGER_STATEFS_BATTERY_PATH"/OnBattery", "w");
-    if(fp!=NULL)
-    {
-        fprintf(fp, "%u\n", on_battery ? 1 : 0);
-        fclose(fp);
-    }
-
-    fp = fopen(PCAT_PMU_MANAGER_FAKE_BATTERY_DEV, "w");
-    if(fp!=NULL)
-    {
-        fprintf(fp, on_battery ? "charging = 0\n" : "charging = 1\n");
-        fclose(fp);
-    }
-
-    fp = fopen(PCAT_PMU_MANAGER_FAKE_BATTERY_DEV, "w");
-    if(fp!=NULL)
-    {
-        fprintf(fp, "capacity0 = %u\n",
-            pmu_data->last_battery_percentage / 100);
-        fclose(fp);
-    }
-}
-
-static void pcat_pmu_serial_read_data_parse(PCatPMUManagerData *pmu_data)
+void pcat_pmu_serial_read_data_parse(PCatPMUManagerData *pmu_data)
 {
     guint i;
     gsize used_size = 0, remaining_size;
     GByteArray *buffer = pmu_data->serial_read_buffer;
-    guint16 expect_len, extra_data_len;
+    guint16 expect_len = 0, extra_data_len;
     const guint8 *p, *extra_data;
     guint16 checksum, rchecksum;
     guint16 command;
@@ -939,7 +759,7 @@ static void pcat_pmu_serial_read_data_parse(PCatPMUManagerData *pmu_data)
             remaining_size = buffer->len - i;
             used_size = i;
 
-            if(remaining_size < 13)
+            if((gsize)(expect_len + 10) > remaining_size)
             {
                 break;
             }
@@ -949,16 +769,6 @@ static void pcat_pmu_serial_read_data_parse(PCatPMUManagerData *pmu_data)
             {
                 used_size = i;
                 continue;
-            }
-            if(expect_len + 10 > remaining_size)
-            {
-                if(used_size > 0)
-                {
-                    g_byte_array_remove_range(
-                        pmu_data->serial_read_buffer, 0, used_size);
-                }
-
-                return;
             }
 
             if(p[9+expect_len]!=0x5A)
@@ -1130,202 +940,41 @@ static void pcat_pmu_serial_read_data_parse(PCatPMUManagerData *pmu_data)
     }
 }
 
-static gboolean pcat_pmu_serial_read_watch_func(GIOChannel *source,
-    GIOCondition condition, gpointer user_data)
+gboolean pcat_pmu_serial_read_watch_func(GIOChannel *source, G_GNUC_UNUSED GIOCondition condition, gpointer user_data)
 {
     PCatPMUManagerData *pmu_data = (PCatPMUManagerData *)user_data;
+    guint8 buffer[1024];
     gssize rsize;
-    guint8 buffer[4096];
+    GError *error = NULL;
 
-    while((rsize=read(pmu_data->serial_fd, buffer, 4096))>0)
+    rsize = g_io_channel_read_chars(source, (gchar *)buffer,
+        sizeof(buffer), NULL, &error);
+    if(rsize > 0)
     {
         g_byte_array_append(pmu_data->serial_read_buffer, buffer, rsize);
-        if(pmu_data->serial_read_buffer->len > 131072)
-        {
-            g_byte_array_remove_range(pmu_data->serial_read_buffer, 0,
-                pmu_data->serial_read_buffer->len - 65536);
-        }
 
         pcat_pmu_serial_read_data_parse(pmu_data);
     }
 
-    if(rsize < 0)
+    if(error!=NULL)
     {
-        if(errno!=EAGAIN)
-        {
-            g_warning("Read serial port with error %s!", strerror(errno));
+        g_warning("Failed to read from serial port: %s",
+            error->message);
+        g_clear_error(&error);
 
-            pcat_pmu_serial_close(pmu_data);
-        }
+        return FALSE;
     }
 
     return TRUE;
 }
 
-static gboolean pcat_pmu_serial_open(PCatPMUManagerData *pmu_data)
-{
-    PCatManagerMainConfigData *main_config_data;
-    int fd;
-    GIOChannel *channel;
-    struct termios options;
-    int rspeed = B115200;
-
-    main_config_data = pcat_main_config_data_get();
-
-    fd = open(main_config_data->pm_serial_device,
-        O_RDWR | O_NOCTTY | O_NDELAY);
-    if(fd < 0)
-    {
-        g_warning("Failed to open serial port %s: %s",
-            main_config_data->pm_serial_device, strerror(errno));
-
-        return FALSE;
-    }
-
-    switch(main_config_data->pm_serial_baud)
-    {
-        case 4800:
-        {
-            rspeed = B4800;
-            break;
-        }
-        case 9600:
-        {
-            rspeed = B9600;
-            break;
-        }
-        case 19200:
-        {
-            rspeed = B19200;
-            break;
-        }
-        case 38400:
-        {
-            rspeed = B38400;
-            break;
-        }
-        case 57600:
-        {
-            rspeed = B57600;
-            break;
-        }
-        case 115200:
-        {
-            rspeed = B115200;
-            break;
-        }
-        default:
-        {
-            g_warning("Invalid serial speed, set to default speed at %u.",
-                115200);
-            break;
-        }
-    }
-
-    tcgetattr(fd, &options);
-    cfmakeraw(&options);
-    cfsetispeed(&options, rspeed);
-    cfsetospeed(&options, rspeed);
-    options.c_cflag &= ~CSIZE;
-    options.c_cflag &= ~PARENB;
-    options.c_cflag &= ~PARODD;
-    options.c_cflag &= ~CSTOPB;
-    options.c_cflag &= ~CRTSCTS;
-    options.c_cflag |= CS8;
-    options.c_cflag |= (CLOCAL | CREAD);
-    options.c_iflag &= ~(IGNBRK | BRKINT | ICRNL |
-        INLCR | PARMRK | INPCK | ISTRIP | IXON | IXOFF | IXANY);
-    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG | IEXTEN);
-    options.c_oflag &= ~OPOST;
-    options.c_cc[VMIN] = 1;
-    options.c_cc[VTIME] = 0;
-    tcflush(fd, TCIOFLUSH);
-    tcsetattr(fd, TCSANOW, &options);
-
-    channel = g_io_channel_unix_new(fd);
-    if(channel==NULL)
-    {
-        g_warning("Cannot open channel for serial port %s!",
-            main_config_data->pm_serial_device);
-        close(fd);
-
-        return FALSE;
-    }
-    g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL);
-
-    if(pmu_data->serial_write_source > 0)
-    {
-        g_source_remove(pmu_data->serial_write_source);
-        pmu_data->serial_write_source = 0;
-    }
-
-    if(pmu_data->serial_read_source > 0)
-    {
-        g_source_remove(pmu_data->serial_read_source);
-        pmu_data->serial_read_source = 0;
-    }
-    if(pmu_data->serial_channel!=NULL)
-    {
-        g_io_channel_unref(pmu_data->serial_channel);
-    }
-    if(pmu_data->serial_fd > 0)
-    {
-        close(pmu_data->serial_fd);
-        pmu_data->serial_fd = -1;
-    }
-
-    pmu_data->serial_fd = fd;
-    pmu_data->serial_channel = channel;
-
-    pmu_data->serial_read_source = g_io_add_watch(channel,
-        G_IO_IN, pcat_pmu_serial_read_watch_func, pmu_data);
-
-    g_message("Open PMU serial port %s successfully.",
-        main_config_data->pm_serial_device);
-
-    return TRUE;
-}
-
-static void pcat_pmu_serial_close(PCatPMUManagerData *pmu_data)
-{
-    if(pmu_data->serial_write_source > 0)
-    {
-        g_source_remove(pmu_data->serial_write_source);
-        pmu_data->serial_write_source = 0;
-    }
-
-    if(pmu_data->serial_read_source > 0)
-    {
-        g_source_remove(pmu_data->serial_read_source);
-        pmu_data->serial_read_source = 0;
-    }
-
-    if(pmu_data->serial_channel!=NULL)
-    {
-        g_io_channel_unref(pmu_data->serial_channel);
-        pmu_data->serial_channel = NULL;
-    }
-
-    if(pmu_data->serial_fd > 0)
-    {
-        close(pmu_data->serial_fd);
-        pmu_data->serial_fd = -1;
-    }
-}
-
-static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
+gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
 {
     PCatPMUManagerData *pmu_data = (PCatPMUManagerData *)user_data;
     const PCatManagerMainConfigData *config_data;
     const PCatManagerUserConfigData *uconfig_data;
     const PCatManagerPowerScheduleData *sdata;
     guint i;
-    GDateTime *dt;
-    gboolean need_action = FALSE;
-    guint dow;
-    gint64 now;
-    guint modem_power_usage;
-    guint shutdown_voltage = 0;
 
     if(pmu_data->serial_channel==NULL)
     {
@@ -1334,11 +983,7 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
         return TRUE;
     }
 
-    now = g_get_monotonic_time();
-    if(pmu_data->last_charger_voltage >= 4200)
-    {
-        pmu_data->charger_on_auto_start_last_timestamp = now;
-    }
+    config_data = pcat_main_config_data_get();
 
     if(!pmu_data->reboot_request && !pmu_data->shutdown_request)
     {
@@ -1346,10 +991,11 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
             PCAT_PMU_MANAGER_COMMAND_HEARTBEAT, FALSE, 0, NULL, 0, FALSE);
 
         uconfig_data = pcat_main_user_config_data_get();
+
         if(uconfig_data->charger_on_auto_start)
         {
             if((pmu_data->power_on_event==3 || pmu_data->power_on_event==4) &&
-               now > pmu_data->charger_on_auto_start_last_timestamp +
+               g_get_monotonic_time() > pmu_data->charger_on_auto_start_last_timestamp +
                (gint64)uconfig_data->charger_on_auto_start_timeout * 1000000L)
             {
                 pcat_main_request_shutdown(TRUE);
@@ -1359,7 +1005,7 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
         else if(uconfig_data->power_schedule_data!=NULL &&
             !pmu_data->shutdown_planned)
         {
-            dt = g_date_time_new_now_utc();
+            GDateTime *dt = g_date_time_new_now_utc();
 
             for(i=0;i<uconfig_data->power_schedule_data->len;i++)
             {
@@ -1386,7 +1032,8 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
                        g_date_time_get_hour(dt)==sdata->hour &&
                        g_date_time_get_minute(dt)==sdata->minute)
                     {
-                        need_action = TRUE;
+                        pcat_main_request_shutdown(TRUE);
+                        pmu_data->shutdown_planned = TRUE;
                     }
                 }
                 else if(sdata->enable_bits &
@@ -1397,7 +1044,8 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
                        g_date_time_get_hour(dt)==sdata->hour &&
                        g_date_time_get_minute(dt)==sdata->minute)
                     {
-                        need_action = TRUE;
+                        pcat_main_request_shutdown(TRUE);
+                        pmu_data->shutdown_planned = TRUE;
                     }
                 }
                 else if(sdata->enable_bits &
@@ -1407,20 +1055,21 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
                        g_date_time_get_hour(dt)==sdata->hour &&
                        g_date_time_get_minute(dt)==sdata->minute)
                     {
-                        need_action = TRUE;
+                        pcat_main_request_shutdown(TRUE);
+                        pmu_data->shutdown_planned = TRUE;
                     }
                 }
                 else if(sdata->enable_bits &
                     PCAT_MANAGER_POWER_SCHEDULE_ENABLE_DOW)
                 {
-                    dow = g_date_time_get_day_of_week(dt) % 7;
+                    guint dow = g_date_time_get_day_of_week(dt) % 7;
 
                     if(((sdata->dow_bits >> dow) & 1) &&
                        g_date_time_get_hour(dt)==sdata->hour &&
                        g_date_time_get_minute(dt)==sdata->minute)
                     {
-                        need_action = TRUE;
-
+                        pcat_main_request_shutdown(TRUE);
+                        pmu_data->shutdown_planned = TRUE;
                     }
                 }
                 else if(sdata->enable_bits &
@@ -1429,21 +1078,22 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
                     if(g_date_time_get_hour(dt)==sdata->hour &&
                        g_date_time_get_minute(dt)==sdata->minute)
                     {
-                        need_action = TRUE;
+                        pcat_main_request_shutdown(TRUE);
+                        pmu_data->shutdown_planned = TRUE;
                     }
                 }
                 else
                 {
                     if(g_date_time_get_minute(dt)==sdata->minute)
                     {
-                        need_action = TRUE;
+                        pcat_main_request_shutdown(TRUE);
+                        pmu_data->shutdown_planned = TRUE;
                     }
                 }
 
-                if(need_action)
+                if(pmu_data->shutdown_planned)
                 {
-                    pcat_main_request_shutdown(TRUE);
-                    pmu_data->shutdown_planned = TRUE;
+                    break;
                 }
             }
 
@@ -1453,10 +1103,12 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
 
     config_data = pcat_main_config_data_get();
 
-    modem_power_usage = pcat_modem_manager_device_power_usage_get();
+    guint modem_power_usage = pcat_modem_manager_device_power_usage_get();
 
     if(pmu_data->modem_power_usage!=modem_power_usage)
     {
+        guint shutdown_voltage = 0;
+
         switch(modem_power_usage)
         {
             case 2:
@@ -1498,7 +1150,7 @@ static gboolean pcat_pmu_manager_check_timeout_func(gpointer user_data)
     if(pmu_data->serial_write_source==0 &&
        pmu_data->serial_write_current_command_data!=NULL &&
         (pmu_data->serial_write_current_command_data->firstrun ||
-        now > pmu_data->serial_write_current_command_data->timestamp +
+        g_get_monotonic_time() > pmu_data->serial_write_current_command_data->timestamp +
         PCAT_PMU_MANAGER_COMMAND_TIMEOUT))
     {
         pmu_data->serial_write_source = g_io_add_watch(
@@ -1514,8 +1166,6 @@ gboolean pcat_pmu_manager_init()
     const PCatManagerMainConfigData *config_data;
     const PCatManagerUserConfigData *uconfig_data;
     guint i;
-    gboolean valid;
-    guint tmp;
 
     if(g_pcat_pmu_manager_data.initialized)
     {
@@ -1543,7 +1193,6 @@ gboolean pcat_pmu_manager_init()
     g_pcat_pmu_manager_data.serial_write_command_queue = g_queue_new();
     g_pcat_pmu_manager_data.serial_write_current_command_data = NULL;
 
-
     if(!pcat_pmu_serial_open(&g_pcat_pmu_manager_data))
     {
         g_warning("Failed to open PMU serial port! Try it later....");
@@ -1561,60 +1210,27 @@ gboolean pcat_pmu_manager_init()
 
     config_data = pcat_main_config_data_get();
 
-    valid = TRUE;
-    tmp = config_data->pm_battery_discharge_table_normal[0];
-    for(i=1;i<11;i++)
+    for(i=0;i<11;i++)
     {
-        if(tmp <= config_data->pm_battery_discharge_table_normal[i])
-        {
-            valid = FALSE;
-            break;
-        }
-        tmp = config_data->pm_battery_discharge_table_normal[i];
-    }
-    if(valid)
-    {
-        for(i=0;i<11;i++)
+        if(config_data->pm_battery_discharge_table_normal[i] > 0)
         {
             g_pcat_pmu_manager_data.battery_discharge_table_normal[i] =
                 config_data->pm_battery_discharge_table_normal[i];
         }
     }
 
-    valid = TRUE;
-    tmp = config_data->pm_battery_discharge_table_5g[0];
-    for(i=1;i<11;i++)
+    for(i=0;i<11;i++)
     {
-        if(tmp <= config_data->pm_battery_discharge_table_5g[i])
-        {
-            valid = FALSE;
-            break;
-        }
-        tmp = config_data->pm_battery_discharge_table_5g[i];
-    }
-    if(valid)
-    {
-        for(i=0;i<11;i++)
+        if(config_data->pm_battery_discharge_table_5g[i] > 0)
         {
             g_pcat_pmu_manager_data.battery_discharge_table_5g[i] =
                 config_data->pm_battery_discharge_table_5g[i];
         }
     }
 
-    valid = TRUE;
-    tmp = config_data->pm_battery_charge_table[0];
-    for(i=1;i<11;i++)
+    for(i=0;i<11;i++)
     {
-        if(tmp <= config_data->pm_battery_charge_table[i])
-        {
-            valid = FALSE;
-            break;
-        }
-        tmp = config_data->pm_battery_charge_table[i];
-    }
-    if(valid)
-    {
-        for(i=0;i<11;i++)
+        if(config_data->pm_battery_charge_table[i] > 0)
         {
             g_pcat_pmu_manager_data.battery_charge_table[i] =
                 config_data->pm_battery_charge_table[i];
@@ -1820,4 +1436,79 @@ void pcat_pmu_manager_voltage_threshold_set(guint led_vh, guint led_vm,
 gint pcat_pmu_manager_board_temp_get()
 {
     return g_pcat_pmu_manager_data.board_temp;
+}
+
+void pcat_pmu_manager_voltage_threshold_set_interval(PCatPMUManagerData *pmu_data,
+    guint voltage_threshold_low_1,
+    guint voltage_threshold_high_1,
+    guint voltage_threshold_low_2,
+    guint voltage_threshold_high_2,
+    guint voltage_threshold_low_3,
+    guint voltage_threshold_high_3,
+    guint voltage_threshold_low_4,
+    guint voltage_threshold_high_4)
+{
+    guint8 buffer[18];
+    const PCatManagerMainConfigData *main_config_data;
+    guint battery_full_threshold;
+
+    main_config_data = pcat_main_config_data_get();
+
+    if(voltage_threshold_low_1==0)
+    {
+        voltage_threshold_low_1 = main_config_data->pm_led_high_voltage;
+    }
+    if(voltage_threshold_high_1==0)
+    {
+        voltage_threshold_high_1 = main_config_data->pm_led_medium_voltage;
+    }
+    if(voltage_threshold_low_2==0)
+    {
+        voltage_threshold_low_2 = main_config_data->pm_led_low_voltage;
+    }
+    if(voltage_threshold_high_2==0)
+    {
+        voltage_threshold_high_2 = main_config_data->pm_startup_voltage;
+    }
+    if(voltage_threshold_low_3==0)
+    {
+        voltage_threshold_low_3 = main_config_data->pm_charger_limit_voltage;
+    }
+    if(voltage_threshold_high_3==0)
+    {
+        voltage_threshold_high_3 = main_config_data->pm_auto_shutdown_voltage_general;
+    }
+    if(voltage_threshold_low_4==0)
+    {
+        voltage_threshold_low_4 = main_config_data->pm_led_work_low_voltage;
+    }
+    if(voltage_threshold_high_4==0)
+    {
+        voltage_threshold_high_4 = main_config_data->pm_charger_fast_voltage;
+    }
+
+    battery_full_threshold = main_config_data->pm_battery_full_threshold;
+
+    buffer[0] = voltage_threshold_low_1 & 0xFF;
+    buffer[1] = (voltage_threshold_low_1 >> 8) & 0xFF;
+    buffer[2] = voltage_threshold_high_1 & 0xFF;
+    buffer[3] = (voltage_threshold_high_1 >> 8) & 0xFF;
+    buffer[4] = voltage_threshold_low_2 & 0xFF;
+    buffer[5] = (voltage_threshold_low_2 >> 8) & 0xFF;
+    buffer[6] = voltage_threshold_high_2 & 0xFF;
+    buffer[7] = (voltage_threshold_high_2 >> 8) & 0xFF;
+    buffer[8] = voltage_threshold_low_3 & 0xFF;
+    buffer[9] = (voltage_threshold_low_3 >> 8) & 0xFF;
+    buffer[10] = voltage_threshold_high_3 & 0xFF;
+    buffer[11] = (voltage_threshold_high_3 >> 8) & 0xFF;
+    buffer[12] = voltage_threshold_low_4 & 0xFF;
+    buffer[13] = (voltage_threshold_low_4 >> 8) & 0xFF;
+    buffer[14] = voltage_threshold_high_4 & 0xFF;
+    buffer[15] = (voltage_threshold_high_4 >> 8) & 0xFF;
+    buffer[16] = battery_full_threshold & 0xFF;
+    buffer[17] = (battery_full_threshold >> 8) & 0xFF;
+
+    pcat_pmu_serial_write_data_request(pmu_data,
+        PCAT_PMU_MANAGER_COMMAND_VOLTAGE_THRESHOLD_SET, FALSE, 0,
+        buffer, 18, TRUE);
 }

@@ -10,6 +10,8 @@
 
 #define PCAT_CONTROLLER_SOCKET_FILE "/tmp/pcat-manager.sock"
 
+#define UNUSED(x) ((void)(x))
+
 typedef struct _PCatControllerConnectionData
 {
     GSocketConnection *connection;
@@ -31,16 +33,28 @@ typedef struct _PCatControllerData
 }PCatControllerData;
 
 typedef void (*PCatControllerCommandCallback)(PCatControllerData *ctrl_data,
-    PCatControllerConnectionData *connection_data, const gchar *command,
+    PCatControllerConnectionData *connection_data,
+    const gchar *command,
     struct json_object *root);
 
-typedef struct _PCatControllerCommandData
-{
+typedef struct _PCatControllerCommand {
     const gchar *command;
     PCatControllerCommandCallback callback;
-}PCatControllerCommandData;
+} PCatControllerCommand;
+
+typedef gboolean (*PCatControllerSourceFunc)(GObject *source, gpointer data);
+typedef gboolean (*PCatControllerTimeoutFunc)(gpointer data);
 
 static PCatControllerData g_pcat_controller_data = {0};
+
+static gboolean pcat_controller_unix_socket_output_watch_func(
+    GObject *source, gpointer user_data);
+static gboolean pcat_controller_unix_socket_input_watch_func(
+    GObject *source, gpointer user_data);
+static void pcat_controller_unix_socket_input_parse(
+    PCatControllerData *ctrl_data,
+    PCatControllerConnectionData *connection_data,
+    const gchar *input);
 
 static void pcat_controller_connection_data_free(
     PCatControllerConnectionData *data)
@@ -79,12 +93,12 @@ static void pcat_controller_connection_data_free(
 }
 
 static gboolean pcat_controller_unix_socket_output_watch_func(
-    GObject *stream, gpointer user_data)
+    GObject *source, gpointer user_data)
 {
     PCatControllerData *ctrl_data = &g_pcat_controller_data;
     PCatControllerConnectionData *connection_data =
         (PCatControllerConnectionData *)user_data;
-    gssize wsize;
+    gssize wsize = 0;
     gsize total_write_size = 0, remaining_size;
     GError *error = NULL;
     gboolean ret = FALSE;
@@ -101,7 +115,7 @@ static gboolean pcat_controller_unix_socket_output_watch_func(
             total_write_size;
 
         wsize = g_pollable_output_stream_write_nonblocking(
-            G_POLLABLE_OUTPUT_STREAM(stream),
+            G_POLLABLE_OUTPUT_STREAM(source),
             connection_data->output_buffer->data + total_write_size,
             remaining_size > 4096 ? 4096 : remaining_size, NULL, &error);
         if(wsize > 0)
@@ -165,131 +179,8 @@ static gboolean pcat_controller_unix_socket_output_watch_func(
     return ret;
 }
 
-static void pcat_controller_unix_socket_output_json_push(
-    PCatControllerData *ctrl_data,
-    PCatControllerConnectionData *connection_data, struct json_object *root)
-{
-    GHashTableIter iter;
-    const gchar *json_data;
-
-    if(ctrl_data==NULL || root==NULL)
-    {
-        return;
-    }
-
-    json_data = json_object_to_json_string(root);
-    if(json_data==NULL)
-    {
-        return;
-    }
-
-    if(connection_data!=NULL)
-    {
-        if(connection_data->output_buffer->len > 2097152)
-        {
-            connection_data->output_buffer->len = 0;
-        }
-
-        g_byte_array_append(connection_data->output_buffer,
-            (const guint8 *)json_data, strlen(json_data)+1);
-
-        if(connection_data->output_stream_source==NULL)
-        {
-            connection_data->output_stream_source =
-                g_pollable_output_stream_create_source(
-                G_POLLABLE_OUTPUT_STREAM(connection_data->output_stream),
-                NULL);
-            g_source_set_callback(connection_data->output_stream_source,
-                (GSourceFunc)pcat_controller_unix_socket_output_watch_func,
-                connection_data, NULL);
-            g_source_attach(connection_data->output_stream_source, NULL);
-        }
-    }
-    else
-    {
-        g_hash_table_iter_init(&iter, ctrl_data->control_connection_table);
-        while(g_hash_table_iter_next(&iter, NULL,
-            (gpointer *)&connection_data))
-        {
-            g_byte_array_append(connection_data->output_buffer,
-                (const guint8 *)json_data, strlen(json_data)+1);
-
-            if(connection_data->output_stream_source==NULL)
-            {
-                connection_data->output_stream_source =
-                    g_pollable_output_stream_create_source(
-                    G_POLLABLE_OUTPUT_STREAM(connection_data->output_stream),
-                    NULL);
-                g_source_set_callback(connection_data->output_stream_source,
-                    (GSourceFunc)
-                    pcat_controller_unix_socket_output_watch_func,
-                    connection_data, NULL);
-                g_source_attach(connection_data->output_stream_source, NULL);
-            }
-        }
-    }
-}
-
-static void pcat_controller_unix_socket_input_parse(
-    PCatControllerData *ctrl_data,
-    PCatControllerConnectionData *connection_data)
-{
-    gsize i;
-    gsize used_size = 0;
-    const gchar *start = (const gchar *)connection_data->input_buffer->data;
-    struct json_tokener *tokener;
-    struct json_object *root, *child;
-    const gchar *command;
-    PCatControllerCommandCallback callback;
-
-    for(i=0;i<connection_data->input_buffer->len;i++)
-    {
-        if(connection_data->input_buffer->data[i]==0)
-        {
-            if(i > used_size)
-            {
-                tokener = json_tokener_new();
-                root = json_tokener_parse_ex(tokener, start, i - used_size);
-                json_tokener_free(tokener);
-
-                if(root!=NULL)
-                {
-                    command = NULL;
-                    if(json_object_object_get_ex(root, "command", &child))
-                    {
-                        command = json_object_get_string(child);
-                    }
-                    if(command!=NULL)
-                    {
-                        callback = g_hash_table_lookup(
-                            ctrl_data->command_table, command);
-                        if(callback!=NULL)
-                        {
-                            callback(ctrl_data, connection_data, command,
-                                root);
-                        }
-
-                        g_debug("Controller got command %s.", command);
-                    }
-
-                    json_object_put(root);
-                }
-            }
-
-            used_size = i + 1;
-            start = (const gchar *)connection_data->input_buffer->data +
-                i + 1;
-        }
-    }
-
-    if(used_size > 0)
-    {
-        g_byte_array_remove_range(connection_data->input_buffer, 0, used_size);
-    }
-}
-
 static gboolean pcat_controller_unix_socket_input_watch_func(
-    GObject *stream, gpointer user_data)
+    GObject *source, gpointer user_data)
 {
     PCatControllerData *ctrl_data = &g_pcat_controller_data;
     PCatControllerConnectionData *connection_data =
@@ -300,7 +191,7 @@ static gboolean pcat_controller_unix_socket_input_watch_func(
     gboolean ret = TRUE;
 
     while((rsize=g_pollable_input_stream_read_nonblocking(
-        G_POLLABLE_INPUT_STREAM(stream), buffer, 4096, NULL, &error))>0)
+        G_POLLABLE_INPUT_STREAM(source), buffer, 4096, NULL, &error))>0)
     {
         if(connection_data->input_buffer->len > 2097152)
         {
@@ -309,7 +200,8 @@ static gboolean pcat_controller_unix_socket_input_watch_func(
         }
         g_byte_array_append(connection_data->input_buffer, buffer, rsize);
 
-        pcat_controller_unix_socket_input_parse(ctrl_data, connection_data);
+        pcat_controller_unix_socket_input_parse(ctrl_data, connection_data,
+            (const gchar *)connection_data->input_buffer->data);
     }
 
     if(error!=NULL)
@@ -351,12 +243,142 @@ static gboolean pcat_controller_unix_socket_input_watch_func(
     return ret;
 }
 
+static void pcat_controller_unix_socket_input_parse(
+    PCatControllerData *controller_data,
+    PCatControllerConnectionData *connection_data,
+    const gchar *input)
+{
+    struct json_object *root_object;
+    struct json_object *command_object;
+    struct json_object *params_object;
+    PCatControllerCommandCallback callback;
+    const gchar *command;
+
+    if(controller_data==NULL || connection_data==NULL || input==NULL)
+        return;
+
+    root_object = json_tokener_parse(input);
+    if(root_object==NULL)
+    {
+        g_warning("Failed to parse input: %s", input);
+
+        return;
+    }
+
+    if(!json_object_object_get_ex(root_object, "command", &command_object))
+    {
+        g_warning("No command field in input: %s", input);
+        json_object_put(root_object);
+
+        return;
+    }
+
+    command = json_object_get_string(command_object);
+    if(command==NULL)
+    {
+        g_warning("Invalid command field in input: %s", input);
+        json_object_put(root_object);
+
+        return;
+    }
+
+    if(!json_object_object_get_ex(root_object, "params", &params_object))
+    {
+        g_warning("No params field in input: %s", input);
+        json_object_put(root_object);
+
+        return;
+    }
+
+    callback = (PCatControllerCommandCallback)g_hash_table_lookup(
+        controller_data->command_table, command);
+    if(callback==NULL)
+    {
+        g_warning("Unknown command: %s", command);
+        json_object_put(root_object);
+
+        return;
+    }
+
+    callback(controller_data, connection_data, command, params_object);
+    json_object_put(root_object);
+}
+
+static void pcat_controller_unix_socket_output_json_push(
+    PCatControllerData *ctrl_data,
+    PCatControllerConnectionData *connection_data, struct json_object *root)
+{
+    GHashTableIter iter;
+    const gchar *json_data;
+
+    if(ctrl_data==NULL || root==NULL)
+    {
+        return;
+    }
+
+    json_data = json_object_to_json_string(root);
+    if(json_data==NULL)
+    {
+        return;
+    }
+
+    if(connection_data!=NULL)
+    {
+        if(connection_data->output_buffer->len > 2097152)
+        {
+            connection_data->output_buffer->len = 0;
+        }
+
+        g_byte_array_append(connection_data->output_buffer,
+            (const guint8 *)json_data, strlen(json_data)+1);
+
+        if(connection_data->output_stream_source==NULL)
+        {
+            connection_data->output_stream_source =
+                g_pollable_output_stream_create_source(
+                G_POLLABLE_OUTPUT_STREAM(connection_data->output_stream),
+                NULL);
+            g_source_set_callback(connection_data->output_stream_source,
+                G_SOURCE_FUNC(pcat_controller_unix_socket_output_watch_func),
+                connection_data, NULL);
+            g_source_attach(connection_data->output_stream_source, NULL);
+        }
+    }
+    else
+    {
+        g_hash_table_iter_init(&iter, ctrl_data->control_connection_table);
+        while(g_hash_table_iter_next(&iter, NULL,
+            (gpointer *)&connection_data))
+        {
+            g_byte_array_append(connection_data->output_buffer,
+                (const guint8 *)json_data, strlen(json_data)+1);
+
+            if(connection_data->output_stream_source==NULL)
+            {
+                connection_data->output_stream_source =
+                    g_pollable_output_stream_create_source(
+                    G_POLLABLE_OUTPUT_STREAM(connection_data->output_stream),
+                    NULL);
+                g_source_set_callback(connection_data->output_stream_source,
+                    G_SOURCE_FUNC(pcat_controller_unix_socket_output_watch_func),
+                    connection_data, NULL);
+                g_source_attach(connection_data->output_stream_source, NULL);
+            }
+        }
+    }
+}
+
 static gboolean pcat_controller_unix_socket_incoming_func(
-    GSocketService *service, GSocketConnection *connection,
-    GObject *source_object, gpointer user_data)
+    GSocketService *service,
+    GSocketConnection *connection,
+    GObject *source_object,
+    gpointer user_data)
 {
     PCatControllerData *ctrl_data = (PCatControllerData *)user_data;
     PCatControllerConnectionData *connection_data;
+
+    (void)service;
+    (void)source_object;
 
     connection_data = g_new0(PCatControllerConnectionData, 1);
     connection_data->connection = g_object_ref(connection);
@@ -371,7 +393,7 @@ static gboolean pcat_controller_unix_socket_incoming_func(
         g_pollable_input_stream_create_source(
         G_POLLABLE_INPUT_STREAM(connection_data->input_stream), NULL);
     g_source_set_callback(connection_data->input_stream_source,
-        (GSourceFunc)pcat_controller_unix_socket_input_watch_func,
+        G_SOURCE_FUNC(pcat_controller_unix_socket_input_watch_func),
         connection_data, NULL);
     g_source_attach(connection_data->input_stream_source, NULL);
 
@@ -406,7 +428,7 @@ static gboolean pcat_controller_unix_socket_connection_check_timeout_func(
                 G_POLLABLE_OUTPUT_STREAM(connection_data->output_stream),
                 NULL);
             g_source_set_callback(connection_data->output_stream_source,
-                (GSourceFunc)pcat_controller_unix_socket_output_watch_func,
+                G_SOURCE_FUNC(pcat_controller_unix_socket_output_watch_func),
                 connection_data, NULL);
             g_source_attach(connection_data->output_stream_source, NULL);
         }
@@ -418,8 +440,11 @@ static gboolean pcat_controller_unix_socket_connection_check_timeout_func(
 static void pcat_controller_command_pmu_status_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
+    (void)root;
+
     struct json_object *rroot, *child;
     guint battery_voltage = 0, charger_voltage = 0, battery_percentage = 0;
     gint board_temp;
@@ -460,7 +485,8 @@ static void pcat_controller_command_pmu_status_func(
 static void pcat_controller_command_schedule_power_event_set_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
     struct json_object *rroot, *child, *array, *node;
     guint array_len;
@@ -469,7 +495,7 @@ static void pcat_controller_command_schedule_power_event_set_func(
     PCatManagerPowerScheduleData *sdata;
     PCatManagerUserConfigData *uconfig_data;
     guint count_on = 0, count_off = 0;
-    gboolean action;
+    gboolean action = FALSE;
     gint y, m, d, h, min;
     GDateTime *dt1, *dt2;
 
@@ -618,8 +644,11 @@ static void pcat_controller_command_schedule_power_event_set_func(
 static void pcat_controller_command_schedule_power_event_get_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
+    UNUSED(root);
+
     struct json_object *rroot, *child, *array, *node;
     guint i;
     PCatManagerPowerScheduleData *sdata;
@@ -717,8 +746,11 @@ static void pcat_controller_command_schedule_power_event_get_func(
 static void pcat_controller_command_modem_status_get_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
+    UNUSED(root);
+
     struct json_object *rroot, *child;
     PCatModemManagerMode mode = PCAT_MODEM_MANAGER_MODE_NONE;
     PCatModemManagerSIMState sim_state = PCAT_MODEM_MANAGER_SIM_STATE_ABSENT;
@@ -842,8 +874,11 @@ static void pcat_controller_command_modem_status_get_func(
 static void pcat_controller_command_network_route_mode_get_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
+    UNUSED(root);
+
     struct json_object *rroot, *child;
     PCatManagerRouteMode mode;
     const gchar *mode_str = "none";
@@ -892,7 +927,8 @@ static void pcat_controller_command_network_route_mode_get_func(
 static void pcat_controller_command_charger_on_auto_start_set_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
     struct json_object *rroot, *child;
     PCatManagerUserConfigData *uconfig_data;
@@ -932,8 +968,11 @@ static void pcat_controller_command_charger_on_auto_start_set_func(
 static void pcat_controller_command_charger_on_auto_start_get_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
+    UNUSED(root);
+
     struct json_object *rroot, *child;
     const PCatManagerUserConfigData *uconfig_data;
     gint64 countdown;
@@ -970,8 +1009,11 @@ static void pcat_controller_command_charger_on_auto_start_get_func(
 static void pcat_controller_command_pmu_fw_version_get_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
+    UNUSED(root);
+
     struct json_object *rroot, *child;
     const gchar *version_str;
 
@@ -996,7 +1038,8 @@ static void pcat_controller_command_pmu_fw_version_get_func(
 static void pcat_controller_command_modem_rfkill_mode_set_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
     struct json_object *rroot, *child;
     gboolean state = FALSE;
@@ -1024,7 +1067,8 @@ static void pcat_controller_command_modem_rfkill_mode_set_func(
 static void pcat_controller_command_modem_network_setup_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
     struct json_object *rroot, *child;
     const gchar *apn_str = NULL;
@@ -1105,8 +1149,11 @@ static void pcat_controller_command_modem_network_setup_func(
 static void pcat_controller_command_modem_network_get_func(
     PCatControllerData *ctrl_data,
     PCatControllerConnectionData *connection_data,
-    const gchar *command, struct json_object *root)
+    const gchar *command,
+    struct json_object *root)
 {
+    UNUSED(root);
+
     struct json_object *rroot, *child;
     const PCatManagerUserConfigData *uconfig_data;
     PCatModemManagerDeviceType device_type;
@@ -1169,51 +1216,50 @@ static void pcat_controller_command_modem_network_get_func(
     json_object_put(rroot);
 }
 
-static PCatControllerCommandData g_pcat_controller_command_list[] =
-{
+static const PCatControllerCommand g_pcat_controller_command_list[] = {
     {
-        .command = "pmu-status",
+        .command = "pmu_status",
         .callback = pcat_controller_command_pmu_status_func
     },
     {
-        .command = "schedule-power-event-set",
+        .command = "pmu_fw_version_get",
+        .callback = pcat_controller_command_pmu_fw_version_get_func
+    },
+    {
+        .command = "modem_network_get",
+        .callback = pcat_controller_command_modem_network_get_func
+    },
+    {
+        .command = "schedule_power_event_set",
         .callback = pcat_controller_command_schedule_power_event_set_func
     },
     {
-        .command = "schedule-power-event-get",
+        .command = "schedule_power_event_get",
         .callback = pcat_controller_command_schedule_power_event_get_func
     },
     {
-        .command = "modem-status-get",
-        .callback = pcat_controller_command_modem_status_get_func,
+        .command = "modem_status_get",
+        .callback = pcat_controller_command_modem_status_get_func
     },
     {
-        .command = "network-route-mode-get",
-        .callback = pcat_controller_command_network_route_mode_get_func,
+        .command = "network_route_mode_get",
+        .callback = pcat_controller_command_network_route_mode_get_func
     },
     {
-        .command = "charger-on-auto-start-set",
-        .callback = pcat_controller_command_charger_on_auto_start_set_func,
+        .command = "charger_on_auto_start_set",
+        .callback = pcat_controller_command_charger_on_auto_start_set_func
     },
     {
-        .command = "charger-on-auto-start-get",
-        .callback = pcat_controller_command_charger_on_auto_start_get_func,
+        .command = "charger_on_auto_start_get",
+        .callback = pcat_controller_command_charger_on_auto_start_get_func
     },
     {
-        .command = "pmu-fw-version-get",
-        .callback = pcat_controller_command_pmu_fw_version_get_func,
+        .command = "modem_rfkill_mode_set",
+        .callback = pcat_controller_command_modem_rfkill_mode_set_func
     },
     {
-        .command = "modem-rfkill-mode-set",
-        .callback = pcat_controller_command_modem_rfkill_mode_set_func,
-    },
-    {
-        .command = "modem-network-setup",
-        .callback = pcat_controller_command_modem_network_setup_func,
-    },
-    {
-        .command = "modem-network-get",
-        .callback = pcat_controller_command_modem_network_get_func,
+        .command = "modem_network_setup",
+        .callback = pcat_controller_command_modem_network_setup_func
     },
     { NULL, NULL }
 };
@@ -1307,32 +1353,34 @@ static void pcat_controller_unix_socket_close(
     g_remove(PCAT_CONTROLLER_SOCKET_FILE);
 }
 
-gboolean pcat_controller_init()
+gboolean pcat_controller_init(PCatControllerData *data)
 {
     guint i;
 
-    if(g_pcat_controller_data.initialized)
+    if(data->initialized)
     {
+        g_warning("PCat controller already initialized!");
+
         return TRUE;
     }
 
-    if(!pcat_controller_unix_socket_open(&g_pcat_controller_data))
+    if(!pcat_controller_unix_socket_open(data))
     {
         g_warning("Failed to open controller socket!");
 
         return FALSE;
     }
 
-    g_pcat_controller_data.command_table = g_hash_table_new_full(
+    data->command_table = g_hash_table_new_full(
         g_str_hash, g_str_equal, g_free, NULL);
     for(i=0;g_pcat_controller_command_list[i].command!=NULL;i++)
     {
-        g_hash_table_replace(g_pcat_controller_data.command_table,
-            g_strdup(g_pcat_controller_command_list[i].command),
-            g_pcat_controller_command_list[i].callback);
+        g_hash_table_insert(data->command_table,
+            (gpointer)g_pcat_controller_command_list[i].command,
+            (gpointer)g_pcat_controller_command_list[i].callback);
     }
 
-    g_pcat_controller_data.initialized = TRUE;
+    data->initialized = TRUE;
 
     return TRUE;
 }
@@ -1354,4 +1402,3 @@ void pcat_controller_uninit()
 
     g_pcat_controller_data.initialized = FALSE;
 }
-
